@@ -1,145 +1,142 @@
-import requests
 import re
-import time
+import requests
 import os
+import time
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
+from deep_translator import GoogleTranslator
 from ebooklib import epub
+import streamlit as st
 
 
 def sanitize_filename(name: str) -> str:
-    """
-    Replace forbidden filesystem characters in a title.
-    """
     return re.sub(r'[\\/:*?"<>|]', '_', name)
 
 
-def fetch_novel(base_url: str,
-                start_page: int = 2,
-                delay: float = 0.5,
-                max_pages: int = None,
-                output_dir: str = 'output') -> None:
-    """
-    Fetch translated chapters via headless Chrome, clean spacing,
-    write to one .txt file (no chapter headers), then convert to EPUB.
+def clean_text(text: str) -> str:
+    # Trim spaces and collapse multiple blank lines
+    text = re.sub(r'[ \t]+$', '', text, flags=re.M)
+    text = re.sub(r'^\s+', '', text, flags=re.M)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
 
-    :param max_pages: stop after this many chapters if set; None fetches until 404.
+
+def translate_in_chunks(chinese: str, translator) -> str:
     """
-    os.makedirs(output_dir, exist_ok=True)
-    page = start_page
+    Split long text into sub-5000-char chunks by paragraphs, translate each,
+    then reassemble.
+    """
+    paras = chinese.split('\n\n')
+    translated_parts = []
+    buffer = ''
+    for p in paras:
+        piece = p.strip()
+        if not piece:
+            continue
+        # +2 for the two newlines when we join
+        if len(buffer) + len(piece) + 2 <= 4800:
+            buffer = buffer + '\n\n' + piece if buffer else piece
+        else:
+            # translate buffer
+            try:
+                translated_parts.append(translator.translate(buffer))
+            except Exception:
+                translated_parts.append(buffer)
+            buffer = piece
+    # last buffer
+    if buffer:
+        try:
+            translated_parts.append(translator.translate(buffer))
+        except Exception:
+            translated_parts.append(buffer)
+    return '\n\n'.join(translated_parts)
+
+
+def scrape_and_build_epub(base_url: str, start_page: int):
+    # temp storage
+    os.makedirs('temp_output', exist_ok=True)
+    translator = GoogleTranslator(source='auto', target='en')
     novel_title = None
-    output_file = None
-    end_page = start_page + max_pages - 1 if max_pages else None
-
-    # Setup headless Chrome for auto-translation
-    chrome_options = Options()
-    chrome_options.add_argument('--headless=new')
-    prefs = {
-        'translate_whitelists': {'zh-CN': 'en'},
-        'translate': {'enabled': True}
-    }
-    chrome_options.add_experimental_option('prefs', prefs)
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=chrome_options
-    )
-    wait = WebDriverWait(driver, 10)
+    txt_path = None
+    page = start_page
 
     while True:
-        if end_page and page > end_page:
-            print("Reached max_pages limit; stopping.")
-            break
-
         url = f"{base_url}_{page}.html"
-        # quick HEAD check for 404
         try:
-            head = requests.head(url, headers={'User-Agent': 'Mozilla/5.0'})
-        except Exception as e:
-            print(f"HEAD request error: {e}")
+            r = requests.head(url, headers={'User-Agent': 'Mozilla/5.0'})
+        except requests.RequestException:
             break
-        if head.status_code == 404:
-            print("404 reached; stopping.")
+        if r.status_code == 404:
             break
 
-        print(f"Loading {url}...")
-        driver.get(url)
-        # wait for translated content
-        try:
-            wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'article-content')))
-            time.sleep(1)
-        except Exception:
-            print(f"Missing content on chapter {page}; skipping.")
-            page += 1
-            time.sleep(delay)
-            continue
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        soup = BeautifulSoup(resp.text, 'html.parser')
 
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-
+        # get title once
         if novel_title is None:
             tag = soup.find(class_='article-title')
             novel_title = tag.get_text(strip=True) if tag else base_url.split('/')[-1]
             fname = sanitize_filename(novel_title) + '.txt'
-            output_file = os.path.join(output_dir, fname)
-            print(f"Novel title: {novel_title}")
-            print(f"Writing to: {output_file}")
+            txt_path = os.path.join('temp_output', fname)
+            with open(txt_path, 'w', encoding='utf-8'):
+                pass
 
+        # extract paragraphs
         content_div = soup.find(class_='article-content')
-        if not content_div:
-            print(f"No content for chapter {page}; skipping.")
-        else:
+        if content_div:
             paras = [p.get_text(strip=True) for p in content_div.find_all('p') if p.get_text(strip=True)]
-            if paras:
-                chapter_text = '\n\n'.join(paras)
-            else:
+            if not paras:
                 raw = content_div.get_text(separator='\n')
-                raw = re.sub(r'[ \t]+$', '', raw, flags=re.M)
-                raw = re.sub(r'^\s+', '', raw, flags=re.M)
-                chapter_text = re.sub(r'\n{3,}', '\n\n', raw)
-
-            with open(output_file, 'a', encoding='utf-8') as f:
-                f.write(chapter_text)
-                f.write('\n\n')
-            print(f"Appended chapter {page}")
+                paras = clean_text(raw).split('\n\n')
+            full_chinese = '\n\n'.join(paras)
+            # translate
+            english = translate_in_chunks(full_chinese, translator)
+            # append
+            with open(txt_path, 'a', encoding='utf-8') as f:
+                f.write(english + '\n\n')
 
         page += 1
-        time.sleep(delay)
+        time.sleep(0.3)
 
-    driver.quit()
+    # build EPUB
+    book = epub.EpubBook()
+    book.set_identifier('id1')
+    book.set_title(novel_title)
+    book.set_language('en')
 
-    # Convert full .txt to single-chapter EPUB
-    if output_file:
-        book = epub.EpubBook()
-        book.set_identifier('id1')
-        book.set_title(novel_title)
-        book.set_language('en')
+    # read the full text
+    with open(txt_path, 'r', encoding='utf-8') as f:
+        full_text = f.read()
 
-        with open(output_file, 'r', encoding='utf-8') as f:
-            full_text = f.read()
+    paras = [p for p in full_text.split('\n\n') if p.strip()]
+    html_body = ''.join(f'<p>{p}</p>' for p in paras)
 
-        paragraphs = [p for p in full_text.split('\n\n') if p.strip()]
-        html_body = ''.join(f'<p>{p}</p>' for p in paragraphs)
+    c = epub.EpubHtml(title=novel_title, file_name='content.xhtml', lang='en')
+    c.content = html_body
+    book.add_item(c)
+    book.toc = (c,)
+    book.spine = ['nav', c]
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
 
-        c = epub.EpubHtml(title=novel_title, file_name='content.xhtml', lang='en')
-        c.content = html_body
-        book.add_item(c)
-        book.toc = (c,)
-        book.spine = ['nav', c]
-        book.add_item(epub.EpubNcx())
-        book.add_item(epub.EpubNav())
-
-        epub_path = output_file.replace('.txt', '.epub')
-        epub.write_epub(epub_path, book)
-        print(f"EPUB created: {epub_path}")
+    epub_path = txt_path.replace('.txt', '.epub')
+    epub.write_epub(epub_path, book)
+    return epub_path, novel_title
 
 
-if __name__ == '__main__':
-    # pip install requests beautifulsoup4 selenium webdriver_manager ebooklib
-    BASE_URL = 'https://www.52shuku.vip/yanqing/07_b/bjYyq'
-    # Fetch the entire novel until 404:
-    fetch_novel(BASE_URL, start_page=2)
+st.title("Webnovel ePub Downloader")
+link = st.text_input("First chapter URL (…_2.html):")
+if st.button("Download ePub"):
+    if not link:
+        st.error("Enter a valid URL ending in _n.html.")
+    else:
+        m = re.match(r"(.+)_([0-9]+)\.html", link)
+        if not m:
+            st.error("URL must end with _<number>.html")
+        else:
+            base, num = m.group(1), int(m.group(2))
+            with st.spinner("Working… this may take some minutes"):
+                epub_file, title = scrape_and_build_epub(base, start_page=num)
+            with open(epub_file, 'rb') as ef:
+                data = ef.read()
+            st.success(f"Done: {title}")
+            st.download_button("Download ePub", data=data, file_name=os.path.basename(epub_file), mime="application/epub+zip")
